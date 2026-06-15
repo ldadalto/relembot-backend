@@ -1,0 +1,20 @@
+{
+  "name": "relembot-backend",
+  "version": "1.0.0",
+  "description": "Proxy backend for Relembot — keeps Claude API key off the device",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@anthropic-ai/sdk": "^0.27.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
