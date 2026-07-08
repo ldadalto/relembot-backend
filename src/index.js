@@ -1,5 +1,7 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
+const { initSchema } = require('./db');
+const { verifyGoogleIdToken, upsertUserAndGetTrialStart } = require('./auth');
 
 const app = express();
 app.use(express.json());
@@ -21,6 +23,24 @@ function requireAuth(req, res, next) {
 // ── Health check ─────────────────────────────────────────────────────────────
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
+
+// ── POST /auth/google ─────────────────────────────────────────────────────────
+// Verifica o ID Token do Google Sign-In e retorna o trial_start_ts autoritativo
+// (ancorado na conta Google — sobrevive a desinstalar/reinstalar o app).
+
+app.post('/auth/google', requireAuth, async (req, res) => {
+  const { idToken } = req.body;
+  if (!idToken) return res.status(400).json({ error: 'idToken is required' });
+
+  try {
+    const payload = await verifyGoogleIdToken(idToken);
+    const trialStartTs = await upsertUserAndGetTrialStart(payload.sub, payload.email);
+    res.json({ trialStartTs });
+  } catch (err) {
+    console.error('[auth/google]', err.message);
+    res.status(401).json({ error: 'Invalid Google ID token' });
+  }
+});
 
 // ── POST /extract-task ────────────────────────────────────────────────────────
 
@@ -164,4 +184,9 @@ Responda APENAS com JSON puro sem markdown:
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Relembot backend running on port ${PORT}`));
+initSchema()
+  .then(() => app.listen(PORT, () => console.log(`Relembot backend running on port ${PORT}`)))
+  .catch((err) => {
+    console.error('[db] Falha ao inicializar schema:', err.message);
+    process.exit(1);
+  });
