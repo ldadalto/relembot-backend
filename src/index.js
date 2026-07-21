@@ -181,6 +181,54 @@ Responda APENAS com JSON puro sem markdown:
   }
 });
 
+// ── POST /daily-summary ───────────────────────────────────────────────────────
+
+app.post('/daily-summary', requireAuth, async (req, res) => {
+  const { userName = '', pendingTasks = [], urgentCount = 0, completedYesterday = 0 } = req.body;
+  const eu = userName || 'Você';
+
+  if (pendingTasks.length === 0 && completedYesterday === 0) {
+    return res.json({ summary: `Bom dia, ${eu}! Nenhuma tarefa pendente no momento. 🎉` });
+  }
+
+  const taskList = pendingTasks.map((t, i) => {
+    let line = `${i + 1}. "${t.tarefa}"`;
+    if (t.contato) line += ` — ${t.contato}`;
+    line += ` (${t.prioridade})`;
+    return line;
+  }).join('\n');
+
+  const prompt = `Você é o assistente do Relembot, app de gestão de tarefas via WhatsApp.
+Escreva o texto de uma notificação de "bom dia" para ${eu}, em português, resumindo o dia.
+
+DADOS:
+- ${pendingTasks.length} tarefa(s) pendente(s), sendo ${urgentCount} urgente(s)
+- Tarefas pendentes:
+${taskList || '(nenhuma)'}
+- Ontem ${eu} concluiu ${completedYesterday} tarefa(s)
+
+REGRAS:
+- No máximo 2 frases curtas, tom direto e motivador, como o corpo de uma notificação push
+- Se houver tarefa urgente, cite ela ou o contato específico
+- Sem markdown, sem aspas ao redor do texto
+
+Responda APENAS com o texto da notificação.`;
+
+  try {
+    const response = await claudeClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 150,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const summary = response.content[0].text.trim();
+    res.json({ summary });
+  } catch (err) {
+    console.error('[daily-summary]', err.message);
+    res.status(500).json({ error: 'Claude API error', detail: err.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
