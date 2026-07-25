@@ -4,7 +4,9 @@ const { initSchema } = require('./db');
 const { verifyGoogleIdToken, upsertUserAndGetTrialStart } = require('./auth');
 
 const app = express();
-app.use(express.json());
+// Padrão do Express é 100kb — a busca envia a lista inteira de tarefas pendentes/concluídas
+// no corpo, e usuários com backlog grande (100-1000 tarefas) estouram esse limite facilmente.
+app.use(express.json({ limit: '5mb' }));
 
 const claudeClient = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 const APP_TOKEN = process.env.APP_TOKEN;
@@ -184,10 +186,10 @@ Responda APENAS com JSON puro sem markdown:
 // ── POST /daily-summary ───────────────────────────────────────────────────────
 
 app.post('/daily-summary', requireAuth, async (req, res) => {
-  const { userName = '', pendingTasks = [], urgentCount = 0, completedYesterday = 0 } = req.body;
+  const { userName = '', pendingTasks = [], urgentCount = 0, completedYesterday = 0, decayedYesterday = 0 } = req.body;
   const eu = userName || 'Você';
 
-  if (pendingTasks.length === 0 && completedYesterday === 0) {
+  if (pendingTasks.length === 0 && completedYesterday === 0 && decayedYesterday === 0) {
     return res.json({ summary: `Bom dia, ${eu}! Nenhuma tarefa pendente no momento. 🎉` });
   }
 
@@ -206,6 +208,7 @@ DADOS:
 - Tarefas pendentes:
 ${taskList || '(nenhuma)'}
 - Ontem ${eu} concluiu ${completedYesterday} tarefa(s)
+${decayedYesterday > 0 ? `- Ontem o decaimento automático arquivou ${decayedYesterday} tarefa(s) parada(s) há muito tempo (mencione isso e que dá pra resgatar em Arquivadas)` : ''}
 
 REGRAS:
 - No máximo 2 frases curtas, tom direto e motivador, como o corpo de uma notificação push
@@ -227,6 +230,85 @@ Responda APENAS com o texto da notificação.`;
     console.error('[daily-summary]', err.message);
     res.status(500).json({ error: 'Claude API error', detail: err.message });
   }
+});
+
+// ── POST /cleanup-analysis ────────────────────────────────────────────────────
+// Faxina com IA: classifica um lote (até 100) de tarefas pendentes em
+// resolvida | expirada | duplicada | relevante. A aritmética de datas (diasParada,
+// prazoVencidoDias) já vem pronta do app — o modelo nunca faz contas de data.
+
+app.post('/cleanup-analysis', requireAuth, async (req, res) => {
+  const { userName = '', hoje = '', tasks = [] } = req.body;
+
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return res.status(400).json({ error: 'tasks (não vazio) é obrigatório' });
+  }
+  if (tasks.length > 100) {
+    return res.status(400).json({ error: 'no máximo 100 tarefas por lote' });
+  }
+
+  const eu = userName || 'o usuário';
+  const taskList = tasks.map((t) => {
+    let line = `${t.id} | "${t.tarefa}" | ${t.contato} | ${t.tipo} | diasParada=${t.diasParada}`;
+    line += ` | prazoVencidoDias=${t.prazoVencidoDias ?? 'null'}`;
+    if (t.prazo) line += ` | prazo="${t.prazo}"`;
+    return line;
+  }).join('\n');
+
+  const prompt = `Você é o motor de triagem do Relembot, um organizador de tarefas capturadas do WhatsApp.
+Usuário: ${eu}. Data de hoje: ${hoje}.
+
+Classifique cada tarefa abaixo em exatamente um veredicto:
+
+- "expirada": prazoVencidoDias > 7 (o prazo passou e a janela de ação morreu).
+- "duplicada": mesmo contato + mesma ação em essência (variações de texto da
+  mesma solicitação). Aponte em duplicadaDe o id da tarefa que deve PERMANECER
+  (a mais recente, ou a que tem prazo). Nunca marque todas do grupo como
+  duplicadas — uma sempre fica.
+- "resolvida": tarefa pontual (não recorrente), sem prazo futuro, parada há
+  mais de 30 dias — provavelmente já foi feita na vida real ou perdeu sentido.
+- "relevante": todo o resto. NA DÚVIDA, use "relevante". É melhor manter uma
+  tarefa morta do que arquivar uma viva.
+
+Regras:
+- Tarefas do tipo DELEGADA só podem ser "resolvida" se diasParada > 60
+  (cobranças pendentes tendem a continuar relevantes).
+- confianca entre 0 e 1. Se < 0.7, o app vai manter a tarefa de qualquer forma.
+- A aritmética de datas (diasParada, prazoVencidoDias) já foi calculada pelo
+  app — não faça contas de data, apenas aplique as regras acima.
+- Inclua um objeto de resultado para CADA id recebido, sem pular nenhum.
+- Responda APENAS com JSON puro sem markdown, no formato:
+  {"results":[{"id":123,"veredicto":"...","confianca":0.85,"duplicadaDe":null}]}
+
+Tarefas (id | tarefa | contato | tipo | diasParada | prazoVencidoDias):
+${taskList}`;
+
+  try {
+    const response = await claudeClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 3000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const raw = response.content[0].text
+      .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+
+    const result = JSON.parse(raw);
+    res.json(result);
+  } catch (err) {
+    console.error('[cleanup-analysis]', err.message);
+    res.status(500).json({ error: 'Claude API error', detail: err.message });
+  }
+});
+
+// ── POST /cleanup-feedback ─────────────────────────────────────────────────────
+// Métricas agregadas e anônimas da Faxina com IA (sem user id, sem conteúdo de tarefa).
+// Fire-and-forget do lado do app — aqui só logamos, sem tabela nova (sem infra de
+// eventos por enquanto; falha aqui nunca pode atrapalhar a aplicação da faxina).
+
+app.post('/cleanup-feedback', requireAuth, (req, res) => {
+  console.log('[cleanup-feedback]', JSON.stringify(req.body));
+  res.json({ ok: true });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
