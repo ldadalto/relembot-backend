@@ -47,7 +47,7 @@ app.post('/auth/google', requireAuth, async (req, res) => {
 // ── POST /extract-task ────────────────────────────────────────────────────────
 
 app.post('/extract-task', requireAuth, async (req, res) => {
-  const { contact, message, userName = '', isGroup = false, sentByMe = false } = req.body;
+  const { contact, message, userName = '', isGroup = false, sentByMe = false, existingTags = [] } = req.body;
 
   if (!contact || !message) {
     return res.status(400).json({ error: 'contact and message are required' });
@@ -55,6 +55,9 @@ app.post('/extract-task', requireAuth, async (req, res) => {
 
   const eu = userName || 'Eu';
   const nowDate = new Date().toLocaleDateString('pt-BR');
+  const tagsHint = existingTags.length > 0
+    ? `\nTags que ${eu} já usa: ${existingTags.join(', ')}. Reaproveite uma dessas quando fizer sentido em vez de inventar uma variação parecida (ex: não crie "Qualidade Ar" se "QualidadeAr" já existe).\n`
+    : '';
 
   const direcao = sentByMe ? `
 DIREÇÃO: Mensagem ENVIADA por ${eu} para ${contact} (lado DIREITO do WhatsApp, bolha verde).
@@ -86,7 +89,7 @@ Usuário: ${eu} | Data: ${nowDate}
 ${direcao}
 
 IDENTIFIQUE TAREFAS — explícitas ou implícitas. Não crie tarefa para conversa casual, saudações ou confirmações simples.
-
+${tagsHint}
 Responda APENAS com JSON puro sem markdown:
 {
   "temTarefa": true ou false,
