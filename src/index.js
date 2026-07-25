@@ -159,7 +159,7 @@ ${taskList}
 
 PERGUNTA: ${query}
 
-Responda APENAS com JSON puro sem markdown:
+Responda APENAS com JSON puro sem markdown, "answer" em no máximo 2 frases:
 {
   "answer": "sua resposta em texto para o usuário",
   "indices": [lista com os números (1-based) das tarefas relevantes encontradas, ou [] se nenhuma]
@@ -168,14 +168,20 @@ Responda APENAS com JSON puro sem markdown:
   try {
     const response = await claudeClient.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 600,
+      max_tokens: 1500,
       messages: [{ role: 'user', content: prompt }],
     });
 
     const raw = response.content[0].text
       .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
-    const result = JSON.parse(raw);
+    // A IA às vezes escreve um comentário antes/depois do JSON apesar da instrução —
+    // isolar do primeiro '{' ao último '}' evita falhar o parse por causa disso.
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd = raw.lastIndexOf('}');
+    const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw;
+
+    const result = JSON.parse(jsonSlice);
     res.json(result);
   } catch (err) {
     console.error('[search-tasks]', err.message);
