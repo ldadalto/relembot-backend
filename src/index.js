@@ -97,7 +97,7 @@ Responda APENAS com JSON puro sem markdown:
   "prazo": "prazo em português ou null",
   "prazoTimestamp": timestamp Unix ms ou null,
   "prioridade": "Urgente|Normal|Baixa",
-  "categoria": "Financeiro|Reunião|Cliente|Entrega|Outro"
+  "tags": ["até 3 tags curtas em português — priorize o nome do cliente/empresa/projeto quando a mensagem deixar claro de quem se trata, e opcionalmente um tipo de assunto (financeiro, reunião, entrega, etc). Sem lista fixa, use o que fizer sentido."]
 }
 
 Se não houver tarefa: {"temTarefa":false}
