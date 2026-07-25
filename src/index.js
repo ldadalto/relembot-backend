@@ -148,11 +148,15 @@ app.post('/search-tasks', requireAuth, async (req, res) => {
     if (t.prazo) line += ` | Prazo: ${t.prazo}`;
     if (t.responsavel) line += ` | Responsável: ${t.responsavel}`;
     if (t.contexto) line += ` | Contexto: ${t.contexto}`;
+    if (t.tags) line += ` | Tags: ${t.tags}`;
     return line;
   }).join('\n');
 
   const prompt = `Você é o assistente de busca do Relembot, app de gestão de tarefas do WhatsApp.
 O usuário tem ${tasks.length} tarefa(s). Responda em português, de forma direta e objetiva.
+Leve em conta as Tags de cada tarefa — se a pergunta mencionar um nome que bate com uma tag
+(cliente, projeto, assunto), isso é um forte sinal de relevância mesmo que a palavra não
+apareça no texto da tarefa.
 
 TAREFAS (numeradas a partir de 1):
 ${taskList}
