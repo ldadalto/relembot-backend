@@ -317,6 +317,64 @@ app.post('/cleanup-feedback', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ── POST /regenerate-tags ─────────────────────────────────────────────────────
+// Reprocessamento único de tarefas antigas: a migração pra tags livres converteu a
+// categoria fixa de cada tarefa numa única tag herdada (ex: "Entrega"). Esse endpoint
+// gera tags de verdade a partir do conteúdo já extraído (tarefa/contato/contexto) —
+// não mexe em prazo/prioridade/tipo, só na coluna tags.
+
+app.post('/regenerate-tags', requireAuth, async (req, res) => {
+  const { tasks = [] } = req.body;
+
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return res.status(400).json({ error: 'tasks (não vazio) é obrigatório' });
+  }
+  if (tasks.length > 100) {
+    return res.status(400).json({ error: 'no máximo 100 tarefas por lote' });
+  }
+
+  const taskList = tasks.map((t) => {
+    let line = `${t.id} | "${t.tarefa}" | contato: ${t.contato} | tipo: ${t.tipo}`;
+    if (t.contexto) line += ` | contexto: ${t.contexto}`;
+    return line;
+  }).join('\n');
+
+  const prompt = `Você é o motor de tags do Relembot, um organizador de tarefas capturadas do WhatsApp.
+
+Gere até 3 tags curtas em português para CADA tarefa abaixo — priorize o nome do
+cliente/empresa/projeto quando o contato ou o contexto deixar claro de quem se trata,
+e opcionalmente complemente com um tipo de assunto (financeiro, reunião, entrega, etc).
+Sem lista fixa, use o que fizer sentido pra cada tarefa.
+
+Inclua um objeto de resultado para CADA id recebido, sem pular nenhum.
+Responda APENAS com JSON puro sem markdown, no formato:
+{"results":[{"id":123,"tags":["tag1","tag2"]}]}
+
+Tarefas (id | tarefa | contato | tipo | contexto):
+${taskList}`;
+
+  try {
+    const response = await claudeClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const raw = response.content[0].text
+      .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd = raw.lastIndexOf('}');
+    const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw;
+
+    const result = JSON.parse(jsonSlice);
+    res.json(result);
+  } catch (err) {
+    console.error('[regenerate-tags]', err.message);
+    res.status(500).json({ error: 'Claude API error', detail: err.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
