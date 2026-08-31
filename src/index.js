@@ -1,6 +1,12 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
-const { initSchema } = require('./db');
+const {
+  initSchema,
+  getMonthlyCostUsd,
+  addUsageCostUsd,
+  getUserBySub,
+  setSubscriptionStatus,
+} = require('./db');
 const { verifyGoogleIdToken, upsertUserAndGetTrialStart } = require('./auth');
 
 const app = express();
@@ -22,6 +28,105 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ── Freio de orçamento (proteção financeira) ──────────────────────────────────
+// IMPORTANTE: nenhuma das 5 rotas de IA abaixo recebe identificação de usuário
+// no corpo da requisição (o app não manda google_sub/idToken nelas — só no
+// /auth/google). Ou seja, HOJE não dá pra bloquear só quem já passou do trial
+// e nunca assinou; qualquer trava por usuário exigiria mudar o app Android e
+// publicar uma nova versão (que só chega aos usuários aos poucos, via
+// atualização automática da Play Store).
+//
+// Como proteção imediata — válida para todo mundo, inclusive quem já está
+// com o app antigo instalado — este freio corta as chamadas à Claude assim
+// que o gasto estimado do mês (calculado a partir dos tokens de cada resposta,
+// nos preços do Haiku 4.5: US$1/MTok de entrada, US$5/MTok de saída) ultrapassa
+// um teto configurável. Ajustável via variável de ambiente CLAUDE_MONTHLY_BUDGET_USD
+// no Railway, sem precisar reimplantar nada além do redeploy do backend.
+const MONTHLY_BUDGET_USD = Number(process.env.CLAUDE_MONTHLY_BUDGET_USD || 40);
+const INPUT_PRICE_PER_MTOK = 1.0;   // claude-haiku-4-5-20251001
+const OUTPUT_PRICE_PER_MTOK = 5.0;  // claude-haiku-4-5-20251001
+
+// Cache em memória de curta duração — evita 1 SELECT no Postgres a cada chamada
+// de IA só para checar o orçamento (as 5 rotas juntas podem ser bem frequentes).
+let budgetCache = { costUsd: 0, checkedAt: 0 };
+const BUDGET_CACHE_TTL_MS = 30_000;
+
+async function isBudgetExceeded() {
+  const now = Date.now();
+  if (now - budgetCache.checkedAt > BUDGET_CACHE_TTL_MS) {
+    budgetCache = { costUsd: await getMonthlyCostUsd(), checkedAt: now };
+  }
+  return budgetCache.costUsd >= MONTHLY_BUDGET_USD;
+}
+
+// Chamar depois de toda resposta bem-sucedida da Claude — soma o custo estimado
+// dessa chamada ao total do mês. Nunca deve derrubar a requisição do usuário se
+// falhar (por isso o catch silencioso: pior caso é o freio ficar um pouco atrasado).
+async function trackUsage(usage) {
+  if (!usage) return;
+  const cost =
+    (Number(usage.input_tokens || 0) / 1_000_000) * INPUT_PRICE_PER_MTOK +
+    (Number(usage.output_tokens || 0) / 1_000_000) * OUTPUT_PRICE_PER_MTOK;
+  budgetCache.costUsd += cost; // reflete na hora, sem esperar o próximo SELECT
+  try {
+    await addUsageCostUsd(cost);
+  } catch (err) {
+    console.error('[budget] falha ao registrar uso:', err.message);
+  }
+}
+
+async function requireBudget(req, res, next) {
+  try {
+    if (await isBudgetExceeded()) {
+      console.warn(`[budget] orçamento mensal (US$${MONTHLY_BUDGET_USD}) atingido — bloqueando ${req.path}`);
+      return res.status(503).json({
+        error: 'ai_budget_exceeded',
+        message: 'Limite de uso de IA do mês atingido. Tente novamente em breve.',
+      });
+    }
+    next();
+  } catch (err) {
+    // Se o próprio check falhar (ex: banco fora do ar), deixa passar — não
+    // queremos que uma falha de infraestrutura derrube a feature toda.
+    console.error('[budget] falha ao checar orçamento:', err.message);
+    next();
+  }
+}
+
+// ── Trava de trial/assinatura por usuário ──────────────────────────────────────
+// Complementa o freio de orçamento acima (que é global) com uma trava POR
+// USUÁRIO: bloqueia quem já passou dos 7 dias de trial e nunca assinou.
+//
+// Só funciona para requisições que chegam com "googleSub" no corpo — e só o app
+// Android reconstruído a partir desta mudança manda esse campo (ver ClaudeApi.kt/
+// TaskRepository.kt). Instalações com a versão antiga do app continuam SEM
+// googleSub: para não quebrar quem já paga e está numa versão antiga (que ainda
+// não teve chance de atualizar sozinha pela Play Store), essas requisições são
+// deixadas passar — protegidas só pelo freio de orçamento global, como já era.
+// a mesma lógica vale se o google_sub não for encontrado no banco (edge case).
+const TRIAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function requireActiveUser(req, res, next) {
+  const googleSub = req.body?.googleSub;
+  if (!googleSub) return next(); // app antigo — sem identidade, sem como travar
+
+  try {
+    const user = await getUserBySub(googleSub);
+    if (!user) return next(); // sub desconhecido do backend — não bloqueia por segurança
+
+    const trialActive = Date.now() - Number(user.trial_start_ts) < TRIAL_MS;
+    if (user.is_subscribed || trialActive) return next();
+
+    return res.status(402).json({
+      error: 'trial_expired',
+      message: 'Seu período grátis acabou. Assine o Relembot para continuar.',
+    });
+  } catch (err) {
+    console.error('[trial-gate] falha ao checar usuário:', err.message);
+    next(); // infra fora do ar não deve travar a feature
+  }
+}
+
 // ── Health check ─────────────────────────────────────────────────────────────
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
@@ -37,16 +142,38 @@ app.post('/auth/google', requireAuth, async (req, res) => {
   try {
     const payload = await verifyGoogleIdToken(idToken);
     const trialStartTs = await upsertUserAndGetTrialStart(payload.sub, payload.email);
-    res.json({ trialStartTs });
+    // O app passa a guardar esse "sub" localmente e mandá-lo nas 5 rotas de IA,
+    // para que a trava de trial/assinatura por usuário (requireActiveUser) saiba
+    // quem está pedindo.
+    res.json({ trialStartTs, sub: payload.sub });
   } catch (err) {
     console.error('[auth/google]', err.message);
     res.status(401).json({ error: 'Invalid Google ID token' });
   }
 });
 
+// ── POST /billing/sync ────────────────────────────────────────────────────────
+// O BillingManager do app chama isso toda vez que reconsulta o Play Billing no
+// aparelho (ao conectar, após uma compra, ao restaurar) — mantém o backend
+// sincronizado com o status de assinatura real visto pelo device.
+
+app.post('/billing/sync', requireAuth, async (req, res) => {
+  const { googleSub, subscriptionActive } = req.body;
+  if (!googleSub || typeof subscriptionActive !== 'boolean') {
+    return res.status(400).json({ error: 'googleSub e subscriptionActive (boolean) são obrigatórios' });
+  }
+  try {
+    await setSubscriptionStatus(googleSub, subscriptionActive);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[billing/sync]', err.message);
+    res.status(500).json({ error: 'Falha ao sincronizar assinatura', detail: err.message });
+  }
+});
+
 // ── POST /extract-task ────────────────────────────────────────────────────────
 
-app.post('/extract-task', requireAuth, async (req, res) => {
+app.post('/extract-task', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
   const { contact, message, userName = '', isGroup = false, sentByMe = false, existingTags = [] } = req.body;
 
   if (!contact || !message) {
@@ -126,6 +253,7 @@ Mensagem: "${message}"`;
       if (!sentByMe && result.tipo === 'delegada') result.tipo = 'minha';
     }
 
+    await trackUsage(response.usage);
     res.json(result);
   } catch (err) {
     console.error('[extract-task]', err.message);
@@ -135,7 +263,7 @@ Mensagem: "${message}"`;
 
 // ── POST /search-tasks ────────────────────────────────────────────────────────
 
-app.post('/search-tasks', requireAuth, async (req, res) => {
+app.post('/search-tasks', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
   const { query, tasks = [] } = req.body;
 
   if (!query) return res.status(400).json({ error: 'query is required' });
@@ -189,6 +317,7 @@ Responda APENAS com JSON puro sem markdown, "answer" em no máximo 2 frases:
     const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw;
 
     const result = JSON.parse(jsonSlice);
+    await trackUsage(response.usage);
     res.json(result);
   } catch (err) {
     console.error('[search-tasks]', err.message);
@@ -198,7 +327,7 @@ Responda APENAS com JSON puro sem markdown, "answer" em no máximo 2 frases:
 
 // ── POST /daily-summary ───────────────────────────────────────────────────────
 
-app.post('/daily-summary', requireAuth, async (req, res) => {
+app.post('/daily-summary', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
   const { userName = '', pendingTasks = [], urgentCount = 0, completedYesterday = 0, decayedYesterday = 0 } = req.body;
   const eu = userName || 'Você';
 
@@ -238,6 +367,7 @@ Responda APENAS com o texto da notificação.`;
     });
 
     const summary = response.content[0].text.trim();
+    await trackUsage(response.usage);
     res.json({ summary });
   } catch (err) {
     console.error('[daily-summary]', err.message);
@@ -250,7 +380,7 @@ Responda APENAS com o texto da notificação.`;
 // resolvida | expirada | duplicada | relevante. A aritmética de datas (diasParada,
 // prazoVencidoDias) já vem pronta do app — o modelo nunca faz contas de data.
 
-app.post('/cleanup-analysis', requireAuth, async (req, res) => {
+app.post('/cleanup-analysis', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
   const { userName = '', hoje = '', tasks = [] } = req.body;
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
@@ -307,6 +437,7 @@ ${taskList}`;
       .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
     const result = JSON.parse(raw);
+    await trackUsage(response.usage);
     res.json(result);
   } catch (err) {
     console.error('[cleanup-analysis]', err.message);
@@ -330,7 +461,7 @@ app.post('/cleanup-feedback', requireAuth, (req, res) => {
 // gera tags de verdade a partir do conteúdo já extraído (tarefa/contato/contexto) —
 // não mexe em prazo/prioridade/tipo, só na coluna tags.
 
-app.post('/regenerate-tags', requireAuth, async (req, res) => {
+app.post('/regenerate-tags', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
   const { tasks = [] } = req.body;
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
@@ -375,10 +506,28 @@ ${taskList}`;
     const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw;
 
     const result = JSON.parse(jsonSlice);
+    await trackUsage(response.usage);
     res.json(result);
   } catch (err) {
     console.error('[regenerate-tags]', err.message);
     res.status(500).json({ error: 'Claude API error', detail: err.message });
+  }
+});
+
+// ── GET /admin/usage ──────────────────────────────────────────────────────────
+// Consulta rápida do gasto estimado do mês corrente e do teto configurado, sem
+// precisar abrir o console da Anthropic. Protegido pelo mesmo APP_TOKEN.
+
+app.get('/admin/usage', requireAuth, async (_req, res) => {
+  try {
+    const costUsd = await getMonthlyCostUsd();
+    res.json({
+      monthlyCostUsd: Number(costUsd.toFixed(4)),
+      monthlyBudgetUsd: MONTHLY_BUDGET_USD,
+      budgetExceeded: costUsd >= MONTHLY_BUDGET_USD,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Falha ao consultar uso', detail: err.message });
   }
 });
 
