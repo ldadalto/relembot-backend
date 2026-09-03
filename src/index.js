@@ -97,22 +97,37 @@ async function requireBudget(req, res, next) {
 // Complementa o freio de orçamento acima (que é global) com uma trava POR
 // USUÁRIO: bloqueia quem já passou dos 7 dias de trial e nunca assinou.
 //
-// Só funciona para requisições que chegam com "googleSub" no corpo — e só o app
-// Android reconstruído a partir desta mudança manda esse campo (ver ClaudeApi.kt/
-// TaskRepository.kt). Instalações com a versão antiga do app continuam SEM
-// googleSub: para não quebrar quem já paga e está numa versão antiga (que ainda
-// não teve chance de atualizar sozinha pela Play Store), essas requisições são
-// deixadas passar — protegidas só pelo freio de orçamento global, como já era.
-// a mesma lógica vale se o google_sub não for encontrado no banco (edge case).
+// A identificação é OBRIGATÓRIA. Até a v1.3.1 a conta Google era opcional no
+// onboarding do app, então a maioria das instalações nunca mandava googleSub — e
+// como este middleware deixava essas passar, na prática QUALQUER pessoa usava a
+// IA de graça pra sempre só não tocando em "Conectar". Era o furo de receita
+// principal do produto.
+//
+// A partir da v1.3.2 o app exige o login (no onboarding e numa tela única de
+// reconexão para quem já tinha instalado), e a atualização é obrigatória via
+// In-App Update — então requisição sem googleSub aqui significa versão antiga
+// ou cliente adulterado, e é recusada com 428 (identificação necessária).
 const TRIAL_MS = 7 * 24 * 60 * 60 * 1000;
 
 async function requireActiveUser(req, res, next) {
   const googleSub = req.body?.googleSub;
-  if (!googleSub) return next(); // app antigo — sem identidade, sem como travar
+  if (!googleSub) {
+    return res.status(428).json({
+      error: 'account_required',
+      message: 'Conecte sua conta Google no app para continuar usando o Relembot.',
+    });
+  }
 
   try {
     const user = await getUserBySub(googleSub);
-    if (!user) return next(); // sub desconhecido do backend — não bloqueia por segurança
+    if (!user) {
+      // O app só obtém um googleSub depois de um /auth/google bem-sucedido, que
+      // já cria o usuário. Chegar aqui significa sub forjado ou banco perdido.
+      return res.status(428).json({
+        error: 'account_required',
+        message: 'Conta não reconhecida. Entre novamente com sua conta Google no app.',
+      });
+    }
 
     const trialActive = Date.now() - Number(user.trial_start_ts) < TRIAL_MS;
     if (user.is_subscribed || trialActive) return next();
