@@ -1,0 +1,27 @@
+name: Backend validation
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: relembot_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --include=dev --ignore-scripts
+      - run: npm test
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:ci-only@127.0.0.1:5432/relembot_test
+      - run: npm audit --include=dev --audit-level=moderate

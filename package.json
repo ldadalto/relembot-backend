@@ -4,19 +4,22 @@
   "description": "Proxy backend for Relembot — keeps Claude API key off the device",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "@anthropic-ai/sdk": "^0.27.3",
-    "google-auth-library": "^9.14.2",
-    "pg": "^8.13.0"
+    "express": "^5.2.1",
+    "google-auth-library": "^10.9.1",
+    "luxon": "^3.7.2",
+    "pg": "^8.23.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   }
 }
