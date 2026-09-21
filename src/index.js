@@ -132,6 +132,7 @@ EXEMPLOS com esta direção (recebi):
 `;
 
       const prompt = `Você é assistente de produtividade para profissionais brasileiros no WhatsApp.
+Conversa: ${isGroup ? "GRUPO" : "INDIVIDUAL"}
 Usuário: ${eu} | Instante da mensagem: ${nowDate} | Fuso: ${req.body.timeZone}
 
 ${direcao}
