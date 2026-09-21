@@ -319,3 +319,23 @@ test("Google verification outage does not activate subscription", async (t) => {
   );
   assert.equal(f.subs.size, 0);
 });
+
+for (const status of [404, 410]) {
+  test(`obsolete purchase (${status}) does not block replacement or revocation sync`, async (t) => {
+    const f = await server(t);
+    f.user.trial_start_ts = 1;
+    await f.call("/billing/sync", { purchaseTokens: ["old"] }, f.token);
+    const valid = f.play.get;
+    f.play.get = async token => {
+      if (token === "old") throw { response: { status } };
+      return valid(token);
+    };
+    const revoked = await f.call("/billing/sync", { purchaseTokens: ["old"] }, f.token);
+    assert.equal(revoked.status, 200);
+    assert.equal(revoked.data.subscriptionActive, false);
+    assert.equal(revoked.data.subscriptionExpiresAt, 0);
+    const restored = await f.call("/billing/sync", { purchaseTokens: ["old", "replacement"] }, f.token);
+    assert.equal(restored.status, 200);
+    assert.equal(restored.data.subscriptionActive, true);
+  });
+}

@@ -65,8 +65,16 @@ function createApp({ db, config, claudeClient, google, play }) {
       })
       .strict()
       .parse(req.body);
-    for (const token of purchaseTokens)
-      await billing.verify(req.user.google_sub, token);
+    for (const token of new Set(purchaseTokens)) {
+      try {
+        await billing.verify(req.user.google_sub, token);
+      } catch (error) {
+        // A revoked/expired token cached on the phone must not block a valid
+        // replacement purchase or keep the previous paid expiry in local cache.
+        // Ownership conflicts and provider outages still fail closed.
+        if (error.code !== "invalid_purchase") throw error;
+      }
+    }
     res.json(await billing.entitlement(req.user));
   });
   app.get("/account/entitlement", auth.authenticate, async (req, res) =>
