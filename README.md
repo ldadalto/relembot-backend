@@ -4,7 +4,7 @@ Esta versão exige o app da branch `fix/auditoria-confiabilidade-20260921` de `l
 
 ## Preparar staging
 
-1. Use Node 22+ (CI: Node 24) e PostgreSQL 17. Execute `npm ci --ignore-scripts`.
+1. Use Node 22+ (CI: Node 24) e PostgreSQL 17. Execute `npm ci --include=dev --ignore-scripts`.
 2. Configure as variáveis de `.env.example` no ambiente do processo; o servidor não carrega `.env` automaticamente. `DATABASE_URL`, `CLAUDE_API_KEY`, `GOOGLE_WEB_CLIENT_ID`, `ADMIN_TOKEN` e `PURCHASE_TOKEN_KEY` são obrigatórias. Gere valores independentes: `openssl rand -hex 32`. Guarde a chave de criptografia; trocá-la sem recriptografar os registros impede restaurar os comprovantes salvos.
 3. Habilite a Google Play Android Developer API no projeto Google Cloud e conceda à conta de serviço acesso ao app no Play Console, incluindo consulta de compras/assinaturas e reconhecimento de compras. Monte o JSON fora do repositório e aponte `GOOGLE_APPLICATION_CREDENTIALS` para ele. O pacote é `com.relembot.app` e os produtos aceitos são `relembot_pro_monthly` e `relembot_pro_annual`.
 4. Use o mesmo cliente OAuth **web** em `GOOGLE_WEB_CLIENT_ID` no app e backend; registre também o cliente Android com package/SHA-1 da assinatura de teste. Para validar compras, instale o app pelo canal de teste interno do Google Play e use um testador de licença.
@@ -30,9 +30,9 @@ Antes de chamar a IA, uma transação reserva uma estimativa conservadora de cus
 ## Validar
 
 ```bash
-npm ci --ignore-scripts
+npm ci --include=dev --ignore-scripts
 npm test
-npm audit --audit-level=moderate
+npm audit --include=dev --audit-level=moderate
 ```
 
 `npm test` sem `TEST_DATABASE_URL` informa que o teste PostgreSQL foi pulado. Para validação completa, use **um banco descartável** nessa variável; o teste apaga suas tabelas. Nunca aponte para produção. O CI inicia esse banco automaticamente e executa a integração (migração legada, 20 reservas concorrentes, vínculo de compra e rotação de sessão).
