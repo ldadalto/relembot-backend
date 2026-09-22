@@ -4,6 +4,9 @@ const {
   initSchema,
   getMonthlyCostUsd,
   addUsageCostUsd,
+  getUserDailyCostUsd,
+  addUserUsageCostUsd,
+  getTopUsersToday,
   getUserBySub,
   setSubscriptionStatus,
 } = require('./db');
@@ -29,22 +32,30 @@ function requireAuth(req, res, next) {
 }
 
 // ── Freio de orçamento (proteção financeira) ──────────────────────────────────
-// IMPORTANTE: nenhuma das 5 rotas de IA abaixo recebe identificação de usuário
-// no corpo da requisição (o app não manda google_sub/idToken nelas — só no
-// /auth/google). Ou seja, HOJE não dá pra bloquear só quem já passou do trial
-// e nunca assinou; qualquer trava por usuário exigiria mudar o app Android e
-// publicar uma nova versão (que só chega aos usuários aos poucos, via
-// atualização automática da Play Store).
+// Este freio corta as chamadas à Claude assim que o gasto estimado do mês
+// (calculado a partir dos tokens de cada resposta, nos preços do Haiku 4.5:
+// US$1/MTok de entrada, US$5/MTok de saída) ultrapassa um teto configurável.
+// Ajustável via variável de ambiente CLAUDE_MONTHLY_BUDGET_USD no Railway, sem
+// precisar reimplantar nada além do redeploy do backend.
 //
-// Como proteção imediata — válida para todo mundo, inclusive quem já está
-// com o app antigo instalado — este freio corta as chamadas à Claude assim
-// que o gasto estimado do mês (calculado a partir dos tokens de cada resposta,
-// nos preços do Haiku 4.5: US$1/MTok de entrada, US$5/MTok de saída) ultrapassa
-// um teto configurável. Ajustável via variável de ambiente CLAUDE_MONTHLY_BUDGET_USD
-// no Railway, sem precisar reimplantar nada além do redeploy do backend.
+// Ele é GLOBAL: um total único do mês, somando todo mundo. Sozinho, tem um
+// problema sério — uma única pessoa abusando esgota o teto e derruba TODOS os
+// clientes pagantes com 503. Por isso existe também o teto por usuário logo
+// abaixo (requireUserQuota), que limita o estrago de uma conta só.
 const MONTHLY_BUDGET_USD = Number(process.env.CLAUDE_MONTHLY_BUDGET_USD || 40);
 const INPUT_PRICE_PER_MTOK = 1.0;   // claude-haiku-4-5-20251001
 const OUTPUT_PRICE_PER_MTOK = 5.0;  // claude-haiku-4-5-20251001
+
+// Teto DIÁRIO por usuário, o complemento do freio global acima.
+//
+// Sobre o valor padrão: até agora o backend só registrava o total agregado, então
+// não existe medição de quanto um usuário real consome por dia. Estimando pelos
+// preços acima, uma extração de tarefa custa ~US$0,004 e uma busca com backlog
+// grande ~US$0,01–0,05; mesmo um dia pesado de uso humano fica bem abaixo de
+// US$0,30. US$1,00/dia é ~3x isso: folgado para gente de verdade, e corta um
+// script em minutos. Depois de alguns dias com dados reais (ver /admin/usage,
+// que agora mostra os maiores gastadores), dá para apertar com segurança.
+const DAILY_USER_BUDGET_USD = Number(process.env.CLAUDE_DAILY_USER_BUDGET_USD || 1);
 
 // Cache em memória de curta duração — evita 1 SELECT no Postgres a cada chamada
 // de IA só para checar o orçamento (as 5 rotas juntas podem ser bem frequentes).
@@ -62,7 +73,7 @@ async function isBudgetExceeded() {
 // Chamar depois de toda resposta bem-sucedida da Claude — soma o custo estimado
 // dessa chamada ao total do mês. Nunca deve derrubar a requisição do usuário se
 // falhar (por isso o catch silencioso: pior caso é o freio ficar um pouco atrasado).
-async function trackUsage(usage) {
+async function trackUsage(usage, googleSub) {
   if (!usage) return;
   const cost =
     (Number(usage.input_tokens || 0) / 1_000_000) * INPUT_PRICE_PER_MTOK +
@@ -72,6 +83,13 @@ async function trackUsage(usage) {
     await addUsageCostUsd(cost);
   } catch (err) {
     console.error('[budget] falha ao registrar uso:', err.message);
+  }
+  // Atribuição por usuário, em transação separada de propósito: se ela falhar, o
+  // total global (que é o freio financeiro de verdade) já foi registrado acima.
+  try {
+    await addUserUsageCostUsd(googleSub, cost);
+  } catch (err) {
+    console.error('[quota] falha ao registrar uso por usuário:', err.message);
   }
 }
 
@@ -142,6 +160,36 @@ async function requireActiveUser(req, res, next) {
   }
 }
 
+// ── Teto diário por usuário ───────────────────────────────────────────────────
+// Roda depois de requireActiveUser, então googleSub já existe e já foi conferido
+// contra o banco. Impede que uma conta só consuma o orçamento global do mês e
+// deixe todos os pagantes no 503.
+//
+// Fail-open no catch, igual ao freio global e à trava de trial: banco fora do ar
+// não deve derrubar a feature para quem está pagando.
+async function requireUserQuota(req, res, next) {
+  const googleSub = req.body?.googleSub;
+  if (!googleSub) return next(); // requireActiveUser já garantiu; aqui é só defesa
+
+  try {
+    const spentToday = await getUserDailyCostUsd(googleSub);
+    if (spentToday >= DAILY_USER_BUDGET_USD) {
+      console.warn(
+        `[quota] usuário ${googleSub.slice(0, 6)}… atingiu o teto diário ` +
+        `(US$${spentToday.toFixed(4)} de US$${DAILY_USER_BUDGET_USD}) — bloqueando ${req.path}`
+      );
+      return res.status(429).json({
+        error: 'user_daily_limit',
+        message: 'Você atingiu o limite de uso de IA de hoje. Tente novamente amanhã.',
+      });
+    }
+    next();
+  } catch (err) {
+    console.error('[quota] falha ao checar teto do usuário:', err.message);
+    next();
+  }
+}
+
 // ── Health check ─────────────────────────────────────────────────────────────
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
@@ -188,7 +236,7 @@ app.post('/billing/sync', requireAuth, async (req, res) => {
 
 // ── POST /extract-task ────────────────────────────────────────────────────────
 
-app.post('/extract-task', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
+app.post('/extract-task', requireAuth, requireBudget, requireActiveUser, requireUserQuota, async (req, res) => {
   const { contact, message, userName = '', isGroup = false, sentByMe = false, existingTags = [] } = req.body;
 
   if (!contact || !message) {
@@ -268,7 +316,7 @@ Mensagem: "${message}"`;
       if (!sentByMe && result.tipo === 'delegada') result.tipo = 'minha';
     }
 
-    await trackUsage(response.usage);
+    await trackUsage(response.usage, req.body?.googleSub);
     res.json(result);
   } catch (err) {
     console.error('[extract-task]', err.message);
@@ -278,7 +326,7 @@ Mensagem: "${message}"`;
 
 // ── POST /search-tasks ────────────────────────────────────────────────────────
 
-app.post('/search-tasks', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
+app.post('/search-tasks', requireAuth, requireBudget, requireActiveUser, requireUserQuota, async (req, res) => {
   const { query, tasks = [] } = req.body;
 
   if (!query) return res.status(400).json({ error: 'query is required' });
@@ -332,7 +380,7 @@ Responda APENAS com JSON puro sem markdown, "answer" em no máximo 2 frases:
     const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw;
 
     const result = JSON.parse(jsonSlice);
-    await trackUsage(response.usage);
+    await trackUsage(response.usage, req.body?.googleSub);
     res.json(result);
   } catch (err) {
     console.error('[search-tasks]', err.message);
@@ -342,7 +390,7 @@ Responda APENAS com JSON puro sem markdown, "answer" em no máximo 2 frases:
 
 // ── POST /daily-summary ───────────────────────────────────────────────────────
 
-app.post('/daily-summary', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
+app.post('/daily-summary', requireAuth, requireBudget, requireActiveUser, requireUserQuota, async (req, res) => {
   const { userName = '', pendingTasks = [], urgentCount = 0, completedYesterday = 0, decayedYesterday = 0 } = req.body;
   const eu = userName || 'Você';
 
@@ -382,7 +430,7 @@ Responda APENAS com o texto da notificação.`;
     });
 
     const summary = response.content[0].text.trim();
-    await trackUsage(response.usage);
+    await trackUsage(response.usage, req.body?.googleSub);
     res.json({ summary });
   } catch (err) {
     console.error('[daily-summary]', err.message);
@@ -395,7 +443,7 @@ Responda APENAS com o texto da notificação.`;
 // resolvida | expirada | duplicada | relevante. A aritmética de datas (diasParada,
 // prazoVencidoDias) já vem pronta do app — o modelo nunca faz contas de data.
 
-app.post('/cleanup-analysis', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
+app.post('/cleanup-analysis', requireAuth, requireBudget, requireActiveUser, requireUserQuota, async (req, res) => {
   const { userName = '', hoje = '', tasks = [] } = req.body;
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
@@ -452,7 +500,7 @@ ${taskList}`;
       .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
     const result = JSON.parse(raw);
-    await trackUsage(response.usage);
+    await trackUsage(response.usage, req.body?.googleSub);
     res.json(result);
   } catch (err) {
     console.error('[cleanup-analysis]', err.message);
@@ -476,7 +524,7 @@ app.post('/cleanup-feedback', requireAuth, (req, res) => {
 // gera tags de verdade a partir do conteúdo já extraído (tarefa/contato/contexto) —
 // não mexe em prazo/prioridade/tipo, só na coluna tags.
 
-app.post('/regenerate-tags', requireAuth, requireBudget, requireActiveUser, async (req, res) => {
+app.post('/regenerate-tags', requireAuth, requireBudget, requireActiveUser, requireUserQuota, async (req, res) => {
   const { tasks = [] } = req.body;
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
@@ -521,7 +569,7 @@ ${taskList}`;
     const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw;
 
     const result = JSON.parse(jsonSlice);
-    await trackUsage(response.usage);
+    await trackUsage(response.usage, req.body?.googleSub);
     res.json(result);
   } catch (err) {
     console.error('[regenerate-tags]', err.message);
@@ -535,11 +583,25 @@ ${taskList}`;
 
 app.get('/admin/usage', requireAuth, async (_req, res) => {
   try {
-    const costUsd = await getMonthlyCostUsd();
+    const [costUsd, topUsers] = await Promise.all([
+      getMonthlyCostUsd(),
+      getTopUsersToday(10),
+    ]);
     res.json({
       monthlyCostUsd: Number(costUsd.toFixed(4)),
       monthlyBudgetUsd: MONTHLY_BUDGET_USD,
       budgetExceeded: costUsd >= MONTHLY_BUDGET_USD,
+      dailyUserBudgetUsd: DAILY_USER_BUDGET_USD,
+      // Maiores gastadores de hoje, para calibrar o teto e flagrar abuso. O
+      // google_sub vai truncado de propósito: esta rota é protegida só pelo
+      // APP_TOKEN, que viaja dentro do APK e portanto é público na prática —
+      // não é lugar para despejar identificadores de conta inteiros.
+      topUsersToday: topUsers.map((u) => ({
+        googleSub: `${u.googleSub.slice(0, 6)}…`,
+        costUsd: Number(u.costUsd.toFixed(4)),
+        calls: u.calls,
+        overLimit: u.costUsd >= DAILY_USER_BUDGET_USD,
+      })),
     });
   } catch (err) {
     res.status(500).json({ error: 'Falha ao consultar uso', detail: err.message });
