@@ -12,14 +12,18 @@ async function initSchema() {
     );
   `);
 
-  // Status de assinatura auto-declarado pelo app (BillingManager consulta o Play
-  // Billing no aparelho e reporta o resultado aqui via POST /billing/sync). Não é
-  // verificação server-side do token de compra junto ao Google — fica sujeito a
-  // um app adulterado mentir sobre isso — mas já é muito melhor do que a trava
-  // hoje inexistente, e cobre 100% dos casos normais (app original, sem root).
+  // Status de assinatura. Gravado por POST /billing/sync: com a conta de serviço do
+  // Play configurada (ver playVerify.js), só vira true depois de o backend confirmar
+  // o purchaseToken junto ao Google; sem ela, ainda é o valor declarado pelo app.
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_subscribed BOOLEAN NOT NULL DEFAULT false;
   `);
+
+  // Verificação server-side da assinatura (ver playVerify.js): o token da compra
+  // no Google Play e até quando ela vale. Com isso o backend reconfirma a
+  // renovação sozinho quando a data passa, sem depender do app ser aberto.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS purchase_token TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expiry_ts BIGINT;`);
 
   // Contador de gasto estimado com a API da Claude, por mês (chave 'YYYY-MM').
   // Usado pelo freio de orçamento GLOBAL em index.js.
@@ -124,7 +128,8 @@ async function getTopUsersToday(limit = 10) {
 // Usado pela trava de trial/assinatura em index.js (requireActiveUser).
 async function getUserBySub(googleSub) {
   const result = await pool.query(
-    `SELECT google_sub, trial_start_ts, is_subscribed FROM users WHERE google_sub = $1`,
+    `SELECT google_sub, trial_start_ts, is_subscribed, purchase_token, subscription_expiry_ts
+       FROM users WHERE google_sub = $1`,
     [googleSub]
   );
   return result.rows[0] || null;
@@ -132,11 +137,28 @@ async function getUserBySub(googleSub) {
 
 // Chamado por POST /billing/sync toda vez que o BillingManager do app reconsulta
 // o Play Billing (ao conectar, após uma compra, ou ao restaurar compras).
-async function setSubscriptionStatus(googleSub, isSubscribed) {
+// purchaseToken/expiryTs só vêm preenchidos quando a compra foi verificada no Google.
+async function setSubscriptionStatus(googleSub, isSubscribed, purchaseToken = null, expiryTs = null) {
   await pool.query(
-    `UPDATE users SET is_subscribed = $2 WHERE google_sub = $1`,
-    [googleSub, !!isSubscribed]
+    `UPDATE users
+        SET is_subscribed = $2,
+            purchase_token = COALESCE($3, purchase_token),
+            subscription_expiry_ts = $4
+      WHERE google_sub = $1`,
+    [googleSub, !!isSubscribed, purchaseToken, expiryTs]
   );
+}
+
+// Outra conta já usando este mesmo token de compra? Impede que uma única
+// assinatura seja compartilhada entre várias contas Google.
+async function findOtherSubWithToken(purchaseToken, googleSub) {
+  const result = await pool.query(
+    `SELECT google_sub FROM users
+      WHERE purchase_token = $1 AND google_sub <> $2 AND is_subscribed = true
+      LIMIT 1`,
+    [purchaseToken, googleSub]
+  );
+  return result.rows[0]?.google_sub || null;
 }
 
 module.exports = {
@@ -151,4 +173,5 @@ module.exports = {
   getTopUsersToday,
   getUserBySub,
   setSubscriptionStatus,
+  findOtherSubWithToken,
 };

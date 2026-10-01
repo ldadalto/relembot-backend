@@ -9,7 +9,9 @@ const {
   getTopUsersToday,
   getUserBySub,
   setSubscriptionStatus,
+  findOtherSubWithToken,
 } = require('./db');
+const playVerify = require('./playVerify');
 const { verifyGoogleIdToken, upsertUserAndGetTrialStart } = require('./auth');
 
 const app = express();
@@ -127,6 +129,24 @@ async function requireBudget(req, res, next) {
 // ou cliente adulterado, e é recusada com 428 (identificação necessária).
 const TRIAL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Assinatura verificada tem data de validade. Quando ela passa, reconsulta o Google
+// (pega a renovação automática sem depender de o usuário abrir o app) e grava o
+// resultado. Sem data (assinatura antiga, não verificada) vale o que está gravado.
+async function subscriptionStillValid(user) {
+  const expiry = user.subscription_expiry_ts ? Number(user.subscription_expiry_ts) : null;
+  if (expiry === null || expiry > Date.now()) return true;
+  if (!user.purchase_token || !playVerify.isEnabled()) return false;
+  try {
+    const { active, expiryTs } = await playVerify.verifySubscription(user.purchase_token);
+    await setSubscriptionStatus(user.google_sub, active, user.purchase_token, expiryTs);
+    return active;
+  } catch (err) {
+    // Google fora do ar não deve bloquear quem paga; tenta de novo na próxima chamada.
+    console.error('[trial-gate] falha ao reverificar assinatura:', err.message);
+    return true;
+  }
+}
+
 async function requireActiveUser(req, res, next) {
   const googleSub = req.body?.googleSub;
   if (!googleSub) {
@@ -148,7 +168,8 @@ async function requireActiveUser(req, res, next) {
     }
 
     const trialActive = Date.now() - Number(user.trial_start_ts) < TRIAL_MS;
-    if (user.is_subscribed || trialActive) return next();
+    if (trialActive) return next();
+    if (user.is_subscribed && (await subscriptionStillValid(user))) return next();
 
     return res.status(402).json({
       error: 'trial_expired',
@@ -217,20 +238,46 @@ app.post('/auth/google', requireAuth, async (req, res) => {
 
 // ── POST /billing/sync ────────────────────────────────────────────────────────
 // O BillingManager do app chama isso toda vez que reconsulta o Play Billing no
-// aparelho (ao conectar, após uma compra, ao restaurar) — mantém o backend
-// sincronizado com o status de assinatura real visto pelo device.
+// aparelho (ao conectar, após uma compra, ao restaurar).
+//
+// "Não assinado" é aceito direto: rebaixar o próprio acesso não é risco. "Assinado"
+// só é aceito depois de confirmar o purchaseToken no Google Play — o app não é
+// fonte confiável (o token do app está dentro do APK). Sem a conta de serviço
+// configurada, cai no comportamento antigo e avisa no log.
 
 app.post('/billing/sync', requireAuth, async (req, res) => {
-  const { googleSub, subscriptionActive } = req.body;
+  const { googleSub, subscriptionActive, purchaseToken } = req.body;
   if (!googleSub || typeof subscriptionActive !== 'boolean') {
     return res.status(400).json({ error: 'googleSub e subscriptionActive (boolean) são obrigatórios' });
   }
   try {
-    await setSubscriptionStatus(googleSub, subscriptionActive);
-    res.json({ ok: true });
+    if (!subscriptionActive) {
+      await setSubscriptionStatus(googleSub, false);
+      return res.json({ ok: true, subscriptionActive: false });
+    }
+
+    if (!playVerify.isEnabled()) {
+      console.warn('[billing/sync] GOOGLE_PLAY_SERVICE_ACCOUNT_JSON ausente — assinatura aceita SEM verificação');
+      await setSubscriptionStatus(googleSub, true);
+      return res.json({ ok: true, subscriptionActive: true, verified: false });
+    }
+
+    if (!purchaseToken || typeof purchaseToken !== 'string') {
+      return res.status(400).json({ error: 'purchaseToken é obrigatório para ativar a assinatura' });
+    }
+
+    const otherSub = await findOtherSubWithToken(purchaseToken, googleSub);
+    if (otherSub) {
+      console.warn(`[billing/sync] token já vinculado a outra conta (${otherSub.slice(0, 6)}…)`);
+      return res.status(409).json({ error: 'purchase_token_in_use' });
+    }
+
+    const { active, expiryTs } = await playVerify.verifySubscription(purchaseToken);
+    await setSubscriptionStatus(googleSub, active, purchaseToken, expiryTs);
+    res.json({ ok: true, subscriptionActive: active, verified: true });
   } catch (err) {
     console.error('[billing/sync]', err.message);
-    res.status(500).json({ error: 'Falha ao sincronizar assinatura', detail: err.message });
+    res.status(500).json({ error: 'Falha ao sincronizar assinatura' });
   }
 });
 
