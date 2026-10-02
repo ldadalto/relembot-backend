@@ -215,6 +215,16 @@ async function requireUserQuota(req, res, next) {
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
+// ── GET /app-config ───────────────────────────────────────────────────────────
+// Versão mínima do app. Abaixo dela o app mostra a tela "Atualização necessária"
+// (desde que a Play Store confirme que há atualização para aquele aparelho).
+// Controle por lançamento, sem publicar app: suba MIN_VERSION_CODE no Railway só
+// quando a versão nova estiver 100% disponível em produção. 0/ausente = nunca bloqueia.
+app.get('/app-config', requireAuth, (_, res) => {
+  const minVersionCode = Number.parseInt(process.env.MIN_VERSION_CODE || '0', 10);
+  res.json({ minVersionCode: Number.isFinite(minVersionCode) ? minVersionCode : 0 });
+});
+
 // ── POST /auth/google ─────────────────────────────────────────────────────────
 // Verifica o ID Token do Google Sign-In e retorna o trial_start_ts autoritativo
 // (ancorado na conta Google — sobrevive a desinstalar/reinstalar o app).
