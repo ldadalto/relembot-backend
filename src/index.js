@@ -283,6 +283,17 @@ app.post('/billing/sync', requireAuth, async (req, res) => {
 
 // ── POST /extract-task ────────────────────────────────────────────────────────
 
+// "AAAA-MM-DDTHH:MM" em horário de Brasília → Unix ms. O Brasil não tem horário de
+// verão desde 2019, então o fuso é fixo em -03:00. Formato inválido → null.
+function prazoDataToTimestamp(prazoData) {
+  if (typeof prazoData !== 'string') return null;
+  const m = prazoData.trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?$/);
+  if (!m) return null;
+  const [, y, mo, d, h = '18', mi = '00'] = m;
+  const ts = Date.parse(`${y}-${mo}-${d}T${h}:${mi}:00-03:00`);
+  return Number.isNaN(ts) ? null : ts;
+}
+
 app.post('/extract-task', requireAuth, requireBudget, requireActiveUser, requireUserQuota, async (req, res) => {
   const { contact, message, userName = '', isGroup = false, sentByMe = false, existingTags = [] } = req.body;
 
@@ -291,7 +302,12 @@ app.post('/extract-task', requireAuth, requireBudget, requireActiveUser, require
   }
 
   const eu = userName || 'Eu';
-  const nowDate = new Date().toLocaleDateString('pt-BR');
+  // Data/hora de Brasília, não do servidor (Railway roda em UTC: das 21h à meia-noite
+  // a IA achava que já era o dia seguinte e "amanhã" caía dois dias à frente).
+  const nowDate = new Date().toLocaleString('pt-BR', {
+    timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit',
+    year: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
   const tagsHint = existingTags.length > 0
     ? `\nTags que ${eu} já usa: ${existingTags.join(', ')}. Reaproveite uma dessas quando fizer sentido em vez de inventar uma variação parecida (ex: não crie "Qualidade Ar" se "QualidadeAr" já existe).\n`
     : '';
@@ -321,7 +337,7 @@ EXEMPLOS com esta direção (recebi):
 `;
 
   const prompt = `Você é assistente de produtividade para profissionais brasileiros no WhatsApp.
-Usuário: ${eu} | Data: ${nowDate}
+Usuário: ${eu} | Agora (horário de Brasília): ${nowDate}
 
 ${direcao}
 
@@ -335,7 +351,7 @@ Responda APENAS com JSON puro sem markdown:
   "responsavel": "nome de quem EXECUTA a tarefa",
   "tipo": "minha" ou "delegada",
   "prazo": "prazo em português ou null",
-  "prazoTimestamp": timestamp Unix ms ou null,
+  "prazoData": "data e hora do prazo no formato AAAA-MM-DDTHH:MM (horário de Brasília), calculada a partir de Agora; sem horário na mensagem use 18:00; null se não houver prazo",
   "prioridade": "Urgente|Normal|Baixa",
   "tags": ["até 3 tags curtas em português — priorize o nome do cliente/empresa/projeto quando a mensagem deixar claro de quem se trata, e opcionalmente um tipo de assunto (financeiro, reunião, entrega, etc). Sem lista fixa, use o que fizer sentido."]
 }
@@ -356,6 +372,12 @@ Mensagem: "${message}"`;
       .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
     const result = JSON.parse(raw);
+
+    // O timestamp é calculado aqui, não pela IA: o modelo errava a conta (ex: devolvia
+    // 2024 para "amanhã às 10h" em 2026), o prazo caía no passado, o app não agendava
+    // o alerta e a Faxina tratava a tarefa como vencida há anos.
+    result.prazoTimestamp = prazoDataToTimestamp(result.prazoData);
+    delete result.prazoData;
 
     // Força a direção caso a IA ignore
     if (result.temTarefa) {
